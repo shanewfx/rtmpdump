@@ -26,6 +26,9 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <math.h>
 #include <limits.h>
 
@@ -315,13 +318,15 @@ ServeInvoke(STREAMING_SERVER *server, int which, RTMPPacket *pack, const char *b
          0x00, 0x00, 0x00, 0x09,
          0x00, 0x00, 0x00, 0x00      // first prevTagSize=0
        };
-      int count = 0, flen;
+      int count = 0, flen, fd = -1;
 
       server->rc.m_stream_id = pack->m_nInfoField2;
       AMFProp_GetString(AMF_GetProp(&obj, NULL, 3), &av);
       server->rc.Link.playpath = av;
       if (!av.av_val)
         goto out;
+      RTMP_LogPrintf("Playpath: %.*s\n",
+        server->rc.Link.playpath.av_len, server->rc.Link.playpath.av_val);
 
       /* check for duplicates */
       for (fl = server->f_head; fl; fl=fl->f_next)
@@ -359,43 +364,48 @@ ServeInvoke(STREAMING_SERVER *server, int which, RTMPPacket *pack, const char *b
           av.av_len--;
         }
       flen = av.av_len;
-      /* hope there aren't more than 255 dups */
-      if (count)
-        flen += 2;
-      file = malloc(flen+1);
-
+      file = malloc(flen+3+1);
       memcpy(file, av.av_val, av.av_len);
-      if (count)
-        sprintf(file+av.av_len, "%02x", count);
-      else
-        file[av.av_len] = '\0';
       for (p=file; *p; p++)
         if (*p == ':')
           *p = '_';
-      RTMP_LogPrintf("Playpath: %.*s\nSaving as: %s\n",
-        server->rc.Link.playpath.av_len, server->rc.Link.playpath.av_val,
-        file);
-      out = fopen(file, "wb");
-      free(file);
-      if (!out)
-        ret = 1;
-      else
+      do
         {
-          fwrite(flvHeader, 1, sizeof(flvHeader), out);
-          av = server->rc.Link.playpath;
-          fl = malloc(sizeof(Flist)+av.av_len+1);
-          fl->f_file = out;
-          fl->f_path.av_len = av.av_len;
-          fl->f_path.av_val = (char *)(fl+1);
-          memcpy(fl->f_path.av_val, av.av_val, av.av_len);
-          fl->f_path.av_val[av.av_len] = '\0';
-          fl->f_next = NULL;
-          if (server->f_tail)
-            server->f_tail->f_next = fl;
-          else
-            server->f_head = fl;
-          server->f_tail = fl;
+          sprintf(file+av.av_len, "_%02x", count);
+          fd = open(file, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+          if (fd >= 0)
+            {
+              out = fdopen(fd, "wb");
+              if (!out)
+                {
+                  close(fd);
+                  continue;
+                }
+              RTMP_LogPrintf("Saving as: %s\n", file);
+              fwrite(flvHeader, 1, sizeof(flvHeader), out);
+              av = server->rc.Link.playpath;
+              fl = malloc(sizeof(Flist)+av.av_len+1);
+              fl->f_file = out;
+              fl->f_path.av_len = av.av_len;
+              fl->f_path.av_val = (char *)(fl+1);
+              memcpy(fl->f_path.av_val, av.av_val, av.av_len);
+              fl->f_path.av_val[av.av_len] = '\0';
+              fl->f_next = NULL;
+              if (server->f_tail)
+                server->f_tail->f_next = fl;
+              else
+                server->f_head = fl;
+              server->f_tail = fl;
+              ret = 0;
+              break;
+            }
+          else if (!ret)
+            ret = 1;
         }
+      while (++count <= 0xff);
+      free(file);
+      if (ret)
+          RTMP_LogPrintf("Failed to save stream!\n");
     }
   else if (AVMATCH(&method, &av_onStatus))
     {
